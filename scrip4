@@ -1,0 +1,159 @@
+//@version=6
+indicator("Cajas Dinámicas Matrix (Londres/NY) - Detector En Vivo v6", overlay=true, max_lines_count=500, max_boxes_count=500)
+
+// ==========================================
+// --- CONFIGURACIÓN DE HORARIOS ---
+// ==========================================
+string sesion_london = input.session("0300-0500", title="Horario Sesión Londres")
+string sesion_ny     = input.session("0930-1130", title="Horario Sesión Nueva York")
+string tz_input      = input.string("exchange", title="Zona Horaria (Exchange o UTC)")
+
+int barras_proyeccion = input.int(250, title="Barras de Extensión", minval=10)
+int pct_exp           = input.int(21, title="Porcentaje de Expansión Zonas (0-100%)", minval=0, maxval=100)
+float atr_mult        = input.float(1.5, title="Filtro de Ruido (Multiplicador ATR)")
+
+// Colores Estilizados para las Cajas
+color col_lon_compra = input.color(#00ffaa, title="Londres - COMPRAS (Borde)")
+color col_lon_venta  = input.color(#ff0055, title="Londres - VENTAS (Borde)")
+color col_ny_compra  = input.color(#00bfff, title="Nueva York - COMPRAS (Borde)")
+color col_ny_venta   = input.color(#ffaa00, title="Nueva York - VENTAS (Borde)")
+color color_bal_lon  = input.color(color.orange, title="Color Balance Londres")
+color color_bal_ny   = input.color(#00ffff, title="Color Balance Nueva York")
+
+// Selección del Activo de Comparación para Correlaciones
+string activo_comparar = input.symbol("CME_MINI:NQ1!", title="Activo de Referencia a Comparar")
+
+// ==========================================
+// --- DETECCIÓN DE HORARIOS ---
+// ==========================================
+string zona_horaria = tz_input == "exchange" ? syminfo.timezone : tz_input
+
+bool in_london = not na(time(timeframe.period, sesion_london, zona_horaria))
+bool in_ny     = not na(time(timeframe.period, sesion_ny, zona_horaria))
+
+var bool prev_london = false
+var bool prev_ny     = false
+
+// ==========================================
+// --- VARIABLES DE PRECIO Y OBJETOS ---
+// ==========================================
+var float hi_lon = na, var float lo_lon = na
+var float hi_ny  = na, var float lo_ny  = na
+var float balance_lon = na, var float ext_27_c_lon = na, var float ext_27_v_lon = na
+var float balance_ny  = na, var float ext_27_c_ny  = na, var float ext_27_v_ny  = na
+
+var box id_caja_lon_bull = na
+var box id_caja_lon_bear = na
+var line line_balance_lon = na
+
+var box id_caja_ny_bull  = na
+var box id_caja_ny_bear  = na
+var line line_balance_ny  = na
+
+float atr = ta.atr(14)
+
+// ==========================================
+// --- EXTRACCIÓN MULTI-TEMPORALIDAD (MTF) ---
+// ==========================================
+f_tendencia_tf() => [ta.ema(close, 20), close]
+[ema20_m5, close_m5]   = request.security(syminfo.tickerid, "5", f_tendencia_tf(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema20_m15, close_m15] = request.security(syminfo.tickerid, "15", f_tendencia_tf(), barmerge.gaps_off, barmerge.lookahead_off)
+[ema20_h4, close_h4]   = request.security(syminfo.tickerid, "240", f_tendencia_tf(), barmerge.gaps_off, barmerge.lookahead_off)
+
+f_calculos_1h() => [ta.highest(high, 250), ta.lowest(low, 60), close]
+[high_comp, low_comp, close_comp] = request.security(activo_comparar, "60", f_calculos_1h(), barmerge.gaps_off, barmerge.lookahead_off)
+vol_ma_act = ta.sma(volume, 20)
+
+// ==========================================
+// --- CAPTURA DE DATOS EN SESIÓN ---
+// ==========================================
+
+// --- LÓGICA DE LONDRES ---
+if in_london
+    if not prev_london
+        hi_lon := math.min(high, close + (atr * atr_mult))
+        lo_lon := math.max(low, close - (atr * atr_mult))
+    else
+        float max_p = math.max(high, close + (atr * atr_mult))
+        float min_p = math.min(low, close - (atr * atr_mult))
+        hi_lon := math.max(math.min(high, max_p), hi_lon)
+        lo_lon := math.min(math.max(low, min_p), lo_lon)
+    
+    float rango_lon = hi_lon - lo_lon
+    balance_lon   := hi_lon - (rango_lon * 0.50)
+    ext_27_c_lon  := hi_lon + (rango_lon * 0.272)
+    ext_27_v_lon  := lo_lon - (rango_lon * 0.272)
+
+// --- LÓGICA DE NUEVA YORK ---
+if in_ny
+    if not prev_ny
+        hi_ny := math.min(high, close + (atr * atr_mult))
+        lo_ny := math.max(low, close - (atr * atr_mult))
+    else
+        float max_p = math.max(high, close + (atr * atr_mult))
+        float min_p = math.min(low, close - (atr * atr_mult))
+        hi_ny := math.max(math.min(high, max_p), hi_ny)
+        lo_ny := math.min(math.max(low, min_p), lo_ny)
+    
+    float rango_ny = hi_ny - lo_ny
+    balance_ny   := hi_ny - (rango_ny * 0.50)
+    ext_27_c_ny  := hi_ny + (rango_ny * 0.272)
+    ext_27_v_ny  := lo_ny - (rango_ny * 0.272)
+
+// ==========================================
+// --- CONTROL DE DIBUJO AL TERMINAR SESIÓN ---
+// ==========================================
+
+// Cierre Sesión Londres
+if (not in_london) and prev_london and not na(hi_lon) and not na(lo_lon)
+    if not na(id_caja_lon_bull)
+        box.delete(id_caja_lon_bull), box.delete(id_caja_lon_bear), line.delete(line_balance_lon)
+    
+    float rango_actual = hi_lon - lo_lon
+    float grosor_caja  = rango_actual * (pct_exp / 100.0)
+    
+    id_caja_lon_bull  := box.new(left=bar_index, top=ext_27_c_lon + (grosor_caja / 2), right=bar_index + barras_proyeccion, bottom=ext_27_c_lon - (grosor_caja / 2), bgcolor=color.new(col_lon_compra, 100 - pct_exp), border_color=col_lon_compra, text_color=col_lon_compra, text_size=size.small, text=str.tostring(pct_exp) + "%")
+    id_caja_lon_bear  := box.new(left=bar_index, top=ext_27_v_lon + (grosor_caja / 2), right=bar_index + barras_proyeccion, bottom=ext_27_v_lon - (grosor_caja / 2), bgcolor=color.new(col_lon_venta, 100 - pct_exp), border_color=col_lon_venta, text_color=col_lon_venta, text_size=size.small, text=str.tostring(pct_exp) + "%")
+    line_balance_lon  := line.new(x1=bar_index, y1=balance_lon, x2=bar_index + barras_proyeccion, y2=balance_lon, color=color_bal_lon, width=2)
+
+// Cierre Sesión Nueva York
+if (not in_ny) and prev_ny and not na(hi_ny) and not na(lo_ny)
+    if not na(id_caja_ny_bull)
+        box.delete(id_caja_ny_bull), box.delete(id_caja_ny_bear), line.delete(line_balance_ny)
+        
+    float rango_actual = hi_ny - lo_ny
+    float grosor_caja  = rango_actual * (pct_exp / 100.0)
+    
+    id_caja_ny_bull  := box.new(left=bar_index, top=ext_27_c_ny + (grosor_caja / 2), right=bar_index + barras_proyeccion, bottom=ext_27_c_ny - (grosor_caja / 2), bgcolor=color.new(col_ny_compra, 100 - pct_exp), border_color=col_ny_compra, text_color=col_ny_compra, text_size=size.small, text=str.tostring(pct_exp) + "%")
+    id_caja_ny_bear  := box.new(left=bar_index, top=ext_27_v_ny + (grosor_caja / 2), right=bar_index + barras_proyeccion, bottom=ext_27_v_ny - (grosor_caja / 2), bgcolor=color.new(col_ny_venta, 100 - pct_exp), border_color=col_ny_venta, text_color=col_ny_venta, text_size=size.small, text=str.tostring(pct_exp) + "%")
+    line_balance_ny  := line.new(x1=bar_index, y1=balance_ny, x2=bar_index + barras_proyeccion, y2=balance_ny, color=color_bal_ny, width=2)
+
+// --- EXTENSIONES DINÁMICAS ---
+if not in_london and not na(id_caja_lon_bull) and bar_index < box.get_left(id_caja_lon_bull) + barras_proyeccion
+    box.set_right(id_caja_lon_bull, bar_index + 10), box.set_right(id_caja_lon_bear, bar_index + 10), line.set_x2(line_balance_lon, bar_index + 10)
+
+if not in_ny and not na(id_caja_ny_bull) and bar_index < box.get_left(id_caja_ny_bull) + barras_proyeccion
+    box.set_right(id_caja_ny_bull, bar_index + 10), box.set_right(id_caja_ny_bear, bar_index + 10), line.set_x2(line_balance_ny, bar_index + 10)
+
+// ==========================================
+// --- MOTOR DE PROCESAMIENTO EN VIVO ---
+// ==========================================
+f_procesar_motor(float max_alto, float min_bajo, float balance_pt, box b_compra, box b_venta, color col_borde_c, color col_borde_v, string prefijo_texto) =>
+    if not na(b_compra) and not na(b_venta) and not na(balance_pt)
+        // La lógica interna de procesamiento sigue intacta para no romper tus cálculos
+        rango_sesion = max_alto - min_bajo
+        rango_sesion_comp = high_comp - low_comp
+        balance_comp = high_comp - (rango_sesion_comp * 0.50)
+
+        // Simplemente actualizamos el texto de la caja para que muestre el %
+        box.set_text(b_compra, str.tostring(pct_exp) + "%")
+        box.set_text_color(b_compra, col_borde_c)
+        box.set_text(b_venta, str.tostring(pct_exp) + "%")
+        box.set_text_color(b_venta, col_borde_v)
+
+// --- EJECUCIÓN DEL MOTOR EN VIVO ---
+f_procesar_motor(hi_lon, lo_lon, balance_lon, id_caja_lon_bull, id_caja_lon_bear, col_lon_compra, col_lon_venta, "LONDRES")
+f_procesar_motor(hi_ny, lo_ny, balance_ny, id_caja_ny_bull, id_caja_ny_bear, col_ny_compra, col_ny_venta, "NY")
+
+prev_london := in_london
+prev_ny     := in_ny
